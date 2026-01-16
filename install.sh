@@ -11,8 +11,35 @@ NC='\033[0m'
 
 clear
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}    P-Box 旁路网关全自动部署 (v2.7.3)        ${NC}"
+echo -e "${GREEN}    P-Box 智能部署脚本 (v2.7.4)              ${NC}"
 echo -e "${GREEN}=============================================${NC}"
+
+# --- 0. 环境检测 (PVE vs 普通 Linux) ---
+if ! command -v pveversion >/dev/null 2>&1; then
+    echo -e "${YELLOW}检测结果：当前环境不是 Proxmox VE (PVE)${NC}"
+    echo -e "---------------------------------------------"
+    echo -e "${GREEN}1.${NC} 安装 P-BOX 官方版 (适用于 Ubuntu/Debian/CentOS 等)"
+    echo -e "${GREEN}2.${NC} 退出脚本"
+    echo -e "---------------------------------------------"
+    read -p "请输入选项 [1-2]: " CHOICE
+
+    case $CHOICE in
+        1)
+            echo -e "\n${YELLOW}正在启动官方安装脚本...${NC}"
+            curl -fsSL https://raw.githubusercontent.com/p-box2025/P-BOX/main/install.sh | sudo bash
+            exit 0
+            ;;
+        *)
+            echo -e "${GREEN}已退出。${NC}"
+            exit 0
+            ;;
+    esac
+fi
+
+# ================= 以下是 PVE 专属逻辑 =================
+
+echo -e "${GREEN}检测结果：当前环境为 Proxmox VE，即将开始部署旁路网关。${NC}"
+sleep 2
 
 # 1. 检查 & 开启 TUN
 if [ ! -c /dev/net/tun ]; then
@@ -71,13 +98,23 @@ fi
 # 6. 恢复容器
 echo -e "\n${YELLOW}正在解压并恢复容器...${NC}"
 pct restore $CT_ID "$BACKUP_FILE" --storage local-lvm --unprivileged 1 --force --unique >/dev/null 2>&1
-if [ $? -ne 0 ]; then
+RESTORE_STATUS=$?
+
+if [ $RESTORE_STATUS -ne 0 ]; then
     echo -e "${YELLOW}未找到 local-lvm 存储，尝试使用 local 存储...${NC}"
     pct restore $CT_ID "$BACKUP_FILE" --storage local --unprivileged 1 --force --unique
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}恢复失败，请检查 PVE 存储空间。${NC}"
-        exit 1
-    fi
+    RESTORE_STATUS=$?
+fi
+
+# 恢复完成后立即删除备份文件 (无论成功失败都建议清理，但为了保险仅在逻辑后清理)
+if [ -f "$BACKUP_FILE" ]; then
+    rm -f "$BACKUP_FILE"
+    echo -e "${GREEN} -> 已清理临时下载的备份文件。${NC}"
+fi
+
+if [ $RESTORE_STATUS -ne 0 ]; then
+    echo -e "${RED}恢复失败，请检查 PVE 存储空间。${NC}"
+    exit 1
 fi
 
 # 7. 系统配置
@@ -102,7 +139,6 @@ sleep 5
 pct exec $CT_ID -- bash -c "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1"
 
 # 9. 最终验证与展示
-# 获取当前实际生效的拥塞控制算法
 CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
 if [[ "$CURRENT_ALGO" == "bbr" ]]; then
     BBR_MSG="${GREEN}✅ 已开启 (BBR)${NC}"
