@@ -1,174 +1,150 @@
 #!/bin/bash
 
-# ================= 配置区域 =================
-# 备份文件下载直链
-BACKUP_URL="https://github.com/ike666888/P-BOX-LXC/releases/download/v2.7.2/p-box-lxc.tar.zst"
-# 备份文件本地路径
-BACKUP_FILE="/var/lib/vz/dump/p-box-import.tar.zst"
-# ===========================================
-
+# 定义颜色
+RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-clear
-echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}    P-Box 智能部署脚本 (v3.0)                ${NC}"
-echo -e "${GREEN}=============================================${NC}"
+echo -e "${GREEN}=== PVE P-BOX 自动部署脚本 ===${NC}"
 
-# =================================================================
-# 检测环境 (PVE vs 非PVE)
-# =================================================================
-if ! command -v pveversion >/dev/null 2>&1; then
-    echo -e "${YELLOW}检测环境: 非 Proxmox VE (PVE) 环境${NC}"
-    echo -e "${GREEN}请选择操作：${NC}"
-    echo -e "1. 安装 P-BOX (官方脚本 + 常用工具)"
-    echo -e "2. 退出脚本"
-    read -p "请输入数字 [1-2]: " CHOICE
-
-    case $CHOICE in
-        1)
-            echo -e "\n${YELLOW}正在准备安装环境...${NC}"
-            # 安装基础依赖防止报错
-            if [ -f /etc/debian_version ]; then
-                apt-get update && apt-get install -y curl sudo
-            elif [ -f /etc/redhat-release ]; then
-                yum install -y curl sudo
-            fi
-            echo -e "${YELLOW}开始执行官方安装...${NC}"
-            curl -fsSL https://raw.githubusercontent.com/p-box2025/P-BOX/main/install.sh | sudo bash
-            ;;
-        2)
-            echo -e "${GREEN}已退出。${NC}"
-            exit 0
-            ;;
-        *)
-            echo -e "${RED}无效输入，退出。${NC}"
-            exit 1
-            ;;
-    esac
-    
-    # 非PVE环境安装完后清理脚本自身 
-    rm -f "$0"
-    exit 0
+# 0. 检查依赖
+if ! command -v jq &> /dev/null; then
+    echo -e "${YELLOW}正在安装 jq 用于解析 GitHub API...${NC}"
+    apt-get update && apt-get install -y jq
 fi
 
-# =================================================================
-# PVE 环境的部署逻辑
-# =================================================================
-echo -e "${GREEN}检测环境: Proxmox VE 宿主机${NC}"
+# 1. 基础配置检测
+NEXT_ID=$(pvesh get /cluster/nextid)
+VM_NAME="P-BOX"
+STORAGE="local-lvm" # 默认导入磁盘的存储位置，如果你的PVE没有local-lvm，请改为local
+ISO_PATH="/var/lib/vz/template/iso"
 
-# --- 检测并开启 TUN ---
-if [ ! -c /dev/net/tun ]; then
-    echo -e "${YELLOW}正在加载 TUN 模块...${NC}"
-    modprobe tun
-fi
-if [ ! -c /dev/net/tun ]; then
-    echo -e "${RED}错误：无法加载 TUN 模块，请检查 PVE 内核。${NC}"
-    rm -f "$0" # 失败也清理脚本
-    exit 1
-else
-    echo -e "${GREEN} -> TUN 模式已就绪${NC}"
-fi
+echo -e "检测到下一个可用 VM ID: ${GREEN}${NEXT_ID}${NC}"
 
-# --- 检测并开启 BBR (智能跳过) ---
-CURRENT_ALGO=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
-if [[ "$CURRENT_ALGO" == "bbr" ]]; then
-    echo -e "${GREEN} -> BBR 已开启 (跳过配置)${NC}"
-else
-    echo -e "${YELLOW} -> BBR 未开启，正在配置...${NC}"
-    if ! grep -q "tcp_congestion_control = bbr" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-    sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN} -> BBR 已成功开启${NC}"
-fi
-
-# --- 网络环境检测 ---
-HOST_GW=$(ip route | grep default | awk '{print $3}')
-SUBNET=$(echo $HOST_GW | cut -d'.' -f1-3)
-echo -e "\n${YELLOW}网络环境检测：${NC} 主路由 IP：${GREEN}${HOST_GW}${NC}"
-
-# --- 用户交互配置 ---
+# 2. CPU 交互配置
+HOST_CPU_CORES=$(nproc)
+echo -e "\n=== CPU 配置 ==="
+echo -e "当前宿主机逻辑核心数: ${GREEN}${HOST_CPU_CORES}${NC}"
 while true; do
-    read -p "请输入容器 ID [默认 200]: " CT_ID
-    CT_ID=${CT_ID:-200}
-    if pct status $CT_ID >/dev/null 2>&1; then
-        echo -e "${RED}错误：ID $CT_ID 已存在，请换一个。${NC}"
-    else
+    read -p "请输入分配给 P-BOX 的核心数 (1-${HOST_CPU_CORES}): " VM_CORES
+    if [[ "$VM_CORES" =~ ^[0-9]+$ ]] && [ "$VM_CORES" -ge 1 ] && [ "$VM_CORES" -le "$HOST_CPU_CORES" ]; then
         break
+    else
+        echo -e "${RED}输入无效，请输入有效的核心数。${NC}"
     fi
 done
 
-read -p "请输入静态 IP [默认 ${SUBNET}.200]: " USER_IP
-USER_IP=${USER_IP:-"${SUBNET}.200"}
-if [[ "$USER_IP" != *"/"* ]]; then USER_IP="${USER_IP}/24"; fi
+# 3. 内存交互配置
+HOST_MEM_TOTAL_GB=$(free -g | awk '/^Mem:/{print $2}')
+echo -e "\n=== 内存 配置 ==="
+echo -e "当前宿主机总内存: ${GREEN}${HOST_MEM_TOTAL_GB} GB${NC}"
+while true; do
+    read -p "请输入分配给 P-BOX 的内存大小 (单位: GB): " VM_MEM_GB
+    if [[ "$VM_MEM_GB" =~ ^[0-9]+$ ]] && [ "$VM_MEM_GB" -ge 1 ]; then
+        VM_MEM_MB=$((VM_MEM_GB * 1024))
+        break
+    else
+        echo -e "${RED}输入无效，请输入整数 GB。${NC}"
+    fi
+done
 
-read -p "请输入网关 IP [默认 ${HOST_GW}]: " USER_GW
-USER_GW=${USER_GW:-$HOST_GW}
+# 4. 获取 GitHub 最新 Release 并下载
+REPO="p-box2025/P-BOX-OS"
+echo -e "\n=== 镜像下载 (GitHub Latest) ==="
+echo -e "正在获取 ${REPO} 的最新版本信息..."
 
-# --- 下载检测 (存在则跳过) ---
-echo -e "\n${YELLOW}[Step 1/3] 准备镜像文件...${NC}"
-if [ -f "$BACKUP_FILE" ]; then
-    echo -e "${GREEN} -> 检测到本地已有备份文件，跳过下载。${NC}"
+LATEST_RELEASE_URL=$(curl -s https://api.github.com/repos/${REPO}/releases/latest | jq -r '.assets[] | select(.name | endswith(".img.gz") or endswith(".img") or endswith(".iso")) | .browser_download_url' | head -n 1)
+
+if [ -z "$LATEST_RELEASE_URL" ]; then
+    echo -e "${RED}错误: 未能找到有效的 .img.gz, .img 或 .iso 下载链接。请检查网络或 GitHub API 限制。${NC}"
+    exit 1
+fi
+
+FILENAME=$(basename "$LATEST_RELEASE_URL")
+FILE_PATH="${ISO_PATH}/${FILENAME}"
+
+echo -e "发现最新镜像: ${GREEN}${FILENAME}${NC}"
+echo -e "下载地址: ${LATEST_RELEASE_URL}"
+
+if [ -f "$FILE_PATH" ]; then
+    echo -e "${YELLOW}文件已存在，跳过下载。${NC}"
 else
-    echo -e "${YELLOW} -> 正在下载系统镜像...${NC}"
-    wget -O "$BACKUP_FILE" "$BACKUP_URL" -q --show-progress
+    wget -q --show-progress -O "$FILE_PATH" "$LATEST_RELEASE_URL"
     if [ $? -ne 0 ]; then
-        echo -e "${RED}下载失败，请检查网络。${NC}"
-        rm -f "$BACKUP_FILE"
-        rm -f "$0"
+        echo -e "${RED}下载失败。${NC}"
         exit 1
     fi
 fi
 
-# --- 恢复容器 ---
-echo -e "\n${YELLOW}[Step 2/3] 解压并恢复容器...${NC}"
-pct restore $CT_ID "$BACKUP_FILE" --storage local-lvm --unprivileged 1 --force --unique >/dev/null 2>&1
-if [ $? -ne 0 ]; then
-    echo -e "${YELLOW} -> 尝试使用 local 存储...${NC}"
-    pct restore $CT_ID "$BACKUP_FILE" --storage local --unprivileged 1 --force --unique
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}恢复失败，请检查 PVE 存储空间。${NC}"
-        # 即使失败，是否删除文件取决于策略，这里保留文件以便排查，但清理脚本
-        rm -f "$0"
-        exit 1
-    fi
+# 5. 解压镜像
+# 判断文件类型并解压，最终目标是得到 .img 文件
+FINAL_IMG_PATH=""
+echo -e "\n=== 处理镜像文件 ==="
+
+if [[ "$FILENAME" == *.gz ]]; then
+    echo "正在解压 .gz 文件..."
+    # 解压到同目录，去掉 .gz 后缀
+    gunzip -k -f "$FILE_PATH"
+    FINAL_IMG_PATH="${FILE_PATH%.gz}"
+elif [[ "$FILENAME" == *.zip ]]; then
+    echo "正在解压 .zip 文件..."
+    unzip -o "$FILE_PATH" -d "$ISO_PATH"
+    # 假设 zip 里只有一个 img，或者是同名 img
+    FINAL_IMG_PATH=$(find "$ISO_PATH" -maxdepth 1 -name "*.img" -type f -newermt "$(date -d '1 minute ago' '+%H:%M')" | head -n 1)
+else
+    FINAL_IMG_PATH="$FILE_PATH"
 fi
 
-# --- 部署完成后清理备份文件 ---
-echo -e "${GREEN} -> 清理临时备份文件...${NC}"
-rm -f "$BACKUP_FILE"
+echo -e "准备使用的磁盘镜像: ${GREEN}${FINAL_IMG_PATH}${NC}"
 
-# --- 系统配置 ---
-echo -e "\n${YELLOW}[Step 3/3] 配置网络与权限...${NC}"
-pct set $CT_ID -net0 name=eth0,bridge=vmbr0,ip=$USER_IP,gw=$USER_GW
-pct set $CT_ID -features nesting=1
-pct set $CT_ID -nameserver "223.5.5.5 1.1.1.1"
+# 6. 创建虚拟机
+echo -e "\n=== 创建虚拟机 (ID: ${NEXT_ID}) ==="
 
-CONF_FILE="/etc/pve/lxc/$CT_ID.conf"
-if ! grep -q "lxc.cgroup2.devices.allow" "$CONF_FILE"; then
-cat <<EOF >> "$CONF_FILE"
-lxc.cgroup2.devices.allow: c 10:200 rwm
-lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
-EOF
+# 创建基础配置：Q35, OVMF, 无介质, CPU host, 网络 virtio
+qm create $NEXT_ID \
+  --name "$VM_NAME" \
+  --ostype l26 \
+  --machine q35 \
+  --bios ovmf \
+  --efidisk0 ${STORAGE}:0,pre-enrolled-keys=0 \
+  --sockets 1 \
+  --cores $VM_CORES \
+  --cpu host \
+  --memory $VM_MEM_MB \
+  --net0 virtio,bridge=vmbr0 \
+  --scsihw virtio-scsi-pci 
+
+echo -e "${GREEN}虚拟机骨架创建完成。${NC}"
+
+# 7. 导入磁盘并设置启动
+echo -e "\n=== 导入磁盘镜像 ==="
+# 导入磁盘
+IMPORT_OUT=$(qm importdisk $NEXT_ID "$FINAL_IMG_PATH" $STORAGE --format raw)
+echo "$IMPORT_OUT"
+
+# 解析导入后的磁盘名称 (通常是 vm-ID-disk-1)
+IMPORTED_DISK=$(echo "$IMPORT_OUT" | grep -o "vm-${NEXT_ID}-disk-[0-9]*")
+
+if [ -n "$IMPORTED_DISK" ]; then
+    echo -e "挂载磁盘 ${IMPORTED_DISK} 到 SCSI0..."
+    # 挂载为 SCSI0 (SSD 仿真可选，这里用默认)
+    qm set $NEXT_ID --scsi0 ${STORAGE}:${IMPORTED_DISK}
+    
+    # 设置启动顺序：优先从 scsi0 启动
+    echo -e "设置启动顺序..."
+    qm set $NEXT_ID --boot order=scsi0
+else
+    echo -e "${RED}错误: 无法获取导入后的磁盘名称，请手动检查。${NC}"
+    exit 1
 fi
 
-# --- 启动 ---
-echo -e "${YELLOW}正在启动容器...${NC}"
-pct start $CT_ID
-sleep 5
-pct exec $CT_ID -- bash -c "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1"
+# 8. 开机
+echo -e "\n=== 正在启动虚拟机 ==="
+qm start $NEXT_ID
 
-# --- 最终展示 ---
-REAL_IP=$(echo $USER_IP | cut -d'/' -f1)
-echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN} 🎉 部署成功！ ${NC}"
-echo -e " 管理面板:    ${YELLOW}http://${REAL_IP}:8383${NC}"
-echo -e " Root 密码:   ${YELLOW}aa123123${NC}"
-echo -e "${GREEN}=============================================${NC}"
-
-# --- 部署完成后清理脚本自身 ---
-rm -f "$0"
+echo -e "${GREEN}---------------------------------------------${NC}"
+echo -e "${GREEN}部署完成！${NC}"
+echo -e "虚拟机 ID: ${NEXT_ID}"
+echo -e "IP 地址: 请进入控制台查看或等待 DHCP 分配"
+echo -e "${GREEN}---------------------------------------------${NC}"
